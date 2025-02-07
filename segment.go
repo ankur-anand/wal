@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 
 	"github.com/valyala/bytebufferpool"
 )
@@ -49,9 +50,9 @@ const (
 type segment struct {
 	id                 SegmentID
 	fd                 *os.File
-	currentBlockNumber uint32
-	currentBlockSize   uint32
-	closed             bool
+	currentBlockNumber atomic.Uint32
+	currentBlockSize   atomic.Uint32
+	closed             atomic.Bool
 	header             []byte
 	startupBlock       *startupBlock
 	isStartupTraversal bool
@@ -118,18 +119,20 @@ func openSegmentFile(dirPath, extName string, id uint32) (*segment, error) {
 		return nil, fmt.Errorf("seek to the end of segment file %d%s failed: %v", id, extName, err)
 	}
 
-	return &segment{
-		id:                 id,
-		fd:                 fd,
-		header:             make([]byte, chunkHeaderSize),
-		currentBlockNumber: uint32(offset / blockSize),
-		currentBlockSize:   uint32(offset % blockSize),
+	s := &segment{
+		id:     id,
+		fd:     fd,
+		header: make([]byte, chunkHeaderSize),
 		startupBlock: &startupBlock{
 			block:       make([]byte, blockSize),
 			blockNumber: -1,
 		},
 		isStartupTraversal: false,
-	}, nil
+	}
+
+	s.currentBlockNumber.Store(uint32(offset / blockSize))
+	s.currentBlockSize.Store(uint32(offset % blockSize))
+	return s, nil
 }
 
 // NewReader creates a new segment reader.
@@ -145,7 +148,7 @@ func (seg *segment) NewReader() *segmentReader {
 
 // Sync flushes the segment file to disk.
 func (seg *segment) Sync() error {
-	if seg.closed {
+	if seg.closed.Load() {
 		return nil
 	}
 	return seg.fd.Sync()
@@ -153,8 +156,8 @@ func (seg *segment) Sync() error {
 
 // Remove removes the segment file.
 func (seg *segment) Remove() error {
-	if !seg.closed {
-		seg.closed = true
+	if !seg.closed.Load() {
+		seg.closed.CompareAndSwap(false, true)
 		if err := seg.fd.Close(); err != nil {
 			return err
 		}
@@ -165,18 +168,18 @@ func (seg *segment) Remove() error {
 
 // Close closes the segment file.
 func (seg *segment) Close() error {
-	if seg.closed {
+	if seg.closed.Load() {
 		return nil
 	}
 
-	seg.closed = true
+	seg.closed.CompareAndSwap(false, true)
 	return seg.fd.Close()
 }
 
 // Size returns the size of the segment file.
 func (seg *segment) Size() int64 {
-	size := int64(seg.currentBlockNumber) * int64(blockSize)
-	return size + int64(seg.currentBlockSize)
+	size := int64(seg.currentBlockNumber.Load()) * int64(blockSize)
+	return size + int64(seg.currentBlockSize.Load())
 }
 
 // writeToBuffer calculate chunkPosition for data, write data to bytebufferpool, update segment status
@@ -189,34 +192,34 @@ func (seg *segment) writeToBuffer(data []byte, chunkBuffer *bytebufferpool.ByteB
 	startBufferLen := chunkBuffer.Len()
 	padding := uint32(0)
 
-	if seg.closed {
+	if seg.closed.Load() {
 		return nil, ErrClosed
 	}
 
 	// if the left block size can not hold the chunk header, padding the block
-	if seg.currentBlockSize+chunkHeaderSize >= blockSize {
+	if seg.currentBlockSize.Load()+chunkHeaderSize >= blockSize {
 		// padding if necessary
-		if seg.currentBlockSize < blockSize {
-			p := make([]byte, blockSize-seg.currentBlockSize)
+		if seg.currentBlockSize.Load() < blockSize {
+			p := make([]byte, blockSize-seg.currentBlockSize.Load())
 			chunkBuffer.B = append(chunkBuffer.B, p...)
-			padding += blockSize - seg.currentBlockSize
+			padding += blockSize - seg.currentBlockSize.Load()
 
 			// a new block
-			seg.currentBlockNumber += 1
-			seg.currentBlockSize = 0
+			seg.currentBlockNumber.Add(1)
+			seg.currentBlockSize.Store(0)
 		}
 	}
 
 	// return the start position of the chunk, then the user can use it to read the data.
 	position := &ChunkPosition{
 		SegmentId:   seg.id,
-		BlockNumber: seg.currentBlockNumber,
-		ChunkOffset: int64(seg.currentBlockSize),
+		BlockNumber: seg.currentBlockNumber.Load(),
+		ChunkOffset: int64(seg.currentBlockSize.Load()),
 	}
 
 	dataSize := uint32(len(data))
 	// The entire chunk can fit into the block.
-	if seg.currentBlockSize+dataSize+chunkHeaderSize <= blockSize {
+	if seg.currentBlockSize.Load()+dataSize+chunkHeaderSize <= blockSize {
 		seg.appendChunkBuffer(chunkBuffer, data, ChunkTypeFull)
 		position.ChunkSize = dataSize + chunkHeaderSize
 	} else {
@@ -225,7 +228,7 @@ func (seg *segment) writeToBuffer(data []byte, chunkBuffer *bytebufferpool.ByteB
 		var (
 			leftSize             = dataSize
 			blockCount    uint32 = 0
-			currBlockSize        = seg.currentBlockSize
+			currBlockSize        = seg.currentBlockSize.Load()
 		)
 
 		for leftSize > 0 {
@@ -266,10 +269,10 @@ func (seg *segment) writeToBuffer(data []byte, chunkBuffer *bytebufferpool.ByteB
 	}
 
 	// update segment status
-	seg.currentBlockSize += position.ChunkSize
-	if seg.currentBlockSize >= blockSize {
-		seg.currentBlockNumber += seg.currentBlockSize / blockSize
-		seg.currentBlockSize = seg.currentBlockSize % blockSize
+	seg.currentBlockSize.Add(position.ChunkSize)
+	if seg.currentBlockSize.Load() >= blockSize {
+		seg.currentBlockNumber.Add(seg.currentBlockSize.Load() / blockSize)
+		seg.currentBlockSize.Store(seg.currentBlockSize.Load() % blockSize)
 	}
 
 	return position, nil
@@ -277,21 +280,21 @@ func (seg *segment) writeToBuffer(data []byte, chunkBuffer *bytebufferpool.ByteB
 
 // writeAll write batch data to the segment file.
 func (seg *segment) writeAll(data [][]byte) (positions []*ChunkPosition, err error) {
-	if seg.closed {
+	if seg.closed.Load() {
 		return nil, ErrClosed
 	}
 
 	// if any error occurs, restore the segment status
-	originBlockNumber := seg.currentBlockNumber
-	originBlockSize := seg.currentBlockSize
+	originBlockNumber := seg.currentBlockNumber.Load()
+	originBlockSize := seg.currentBlockSize.Load()
 
 	// init chunk buffer
 	chunkBuffer := bytebufferpool.Get()
 	chunkBuffer.Reset()
 	defer func() {
 		if err != nil {
-			seg.currentBlockNumber = originBlockNumber
-			seg.currentBlockSize = originBlockSize
+			seg.currentBlockNumber.Store(originBlockNumber)
+			seg.currentBlockSize.Store(originBlockSize)
 		}
 		bytebufferpool.Put(chunkBuffer)
 	}()
@@ -315,20 +318,20 @@ func (seg *segment) writeAll(data [][]byte) (positions []*ChunkPosition, err err
 
 // Write writes the data to the segment file.
 func (seg *segment) Write(data []byte) (pos *ChunkPosition, err error) {
-	if seg.closed {
+	if seg.closed.Load() {
 		return nil, ErrClosed
 	}
 
-	originBlockNumber := seg.currentBlockNumber
-	originBlockSize := seg.currentBlockSize
+	originBlockNumber := seg.currentBlockNumber.Load()
+	originBlockSize := seg.currentBlockSize.Load()
 
 	// init chunk buffer
 	chunkBuffer := bytebufferpool.Get()
 	chunkBuffer.Reset()
 	defer func() {
 		if err != nil {
-			seg.currentBlockNumber = originBlockNumber
-			seg.currentBlockSize = originBlockSize
+			seg.currentBlockNumber.Store(originBlockNumber)
+			seg.currentBlockSize.Store(originBlockSize)
 		}
 		bytebufferpool.Put(chunkBuffer)
 	}()
@@ -363,7 +366,7 @@ func (seg *segment) appendChunkBuffer(buf *bytebufferpool.ByteBuffer, data []byt
 
 // write the pending chunk buffer to the segment file
 func (seg *segment) writeChunkBuffer(buf *bytebufferpool.ByteBuffer) error {
-	if seg.currentBlockSize > blockSize {
+	if seg.currentBlockSize.Load() > blockSize {
 		return errors.New("the current block size exceeds the maximum block size")
 	}
 
@@ -384,7 +387,7 @@ func (seg *segment) Read(blockNumber uint32, chunkOffset int64) ([]byte, error) 
 }
 
 func (seg *segment) readInternal(blockNumber uint32, chunkOffset int64) ([]byte, *ChunkPosition, error) {
-	if seg.closed {
+	if seg.closed.Load() {
 		return nil, nil, ErrClosed
 	}
 
@@ -478,7 +481,7 @@ func (seg *segment) readInternal(blockNumber uint32, chunkOffset int64) ([]byte,
 // You can call it repeatedly until io.EOF is returned.
 func (segReader *segmentReader) Next() ([]byte, *ChunkPosition, error) {
 	// The segment file is closed
-	if segReader.segment.closed {
+	if segReader.segment.closed.Load() {
 		return nil, nil, ErrClosed
 	}
 
