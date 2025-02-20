@@ -7,6 +7,7 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
 
@@ -52,6 +53,7 @@ type segment struct {
 	fd                 *os.File
 	currentBlockNumber atomic.Uint32
 	currentBlockSize   atomic.Uint32
+	activeReader       atomic.Int32
 	closed             atomic.Bool
 	header             []byte
 	startupBlock       *startupBlock
@@ -173,6 +175,11 @@ func (seg *segment) Close() error {
 	}
 
 	seg.closed.CompareAndSwap(false, true)
+
+	// retry for the close.
+	for seg.activeReader.Load() > 0 {
+		runtime.Gosched()
+	}
 	return seg.fd.Close()
 }
 
@@ -390,6 +397,9 @@ func (seg *segment) readInternal(blockNumber uint32, chunkOffset int64) ([]byte,
 	if seg.closed.Load() {
 		return nil, nil, ErrClosed
 	}
+
+	seg.activeReader.Add(1)
+	defer seg.activeReader.Add(-1)
 
 	var (
 		result    []byte
