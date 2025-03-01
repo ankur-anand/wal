@@ -1,4 +1,4 @@
-module github.com/rosedblabs/wal
+module github.com/ankur-anand/wal
 
 go 1.21
 
