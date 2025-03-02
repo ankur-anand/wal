@@ -89,6 +89,12 @@ type ChunkPosition struct {
 	ChunkSize uint32
 }
 
+// String method for ChunkPosition
+func (c *ChunkPosition) String() string {
+	return fmt.Sprintf("ChunkPosition{SegmentId: %d, BlockNumber: %d, ChunkOffset: %d, ChunkSize: %d}",
+		c.SegmentId, c.BlockNumber, c.ChunkOffset, c.ChunkSize)
+}
+
 var blockPool = sync.Pool{
 	New: func() interface{} {
 		return make([]byte, blockSize)
