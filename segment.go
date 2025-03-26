@@ -1,16 +1,19 @@
 package wal
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
+	"log/slog"
 	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
 
+	"github.com/allegro/bigcache/v3"
 	"github.com/valyala/bytebufferpool"
 )
 
@@ -49,6 +52,7 @@ const (
 // The segment file is append-only, and the data is written in blocks.
 // Each block is 32KB, and the data is written in chunks.
 type segment struct {
+	cache              *bigcache.BigCache
 	id                 SegmentID
 	fd                 *os.File
 	currentBlockNumber atomic.Uint32
@@ -127,7 +131,14 @@ func openSegmentFile(dirPath, extName string, id uint32) (*segment, error) {
 		return nil, fmt.Errorf("seek to the end of segment file %d%s failed: %v", id, extName, err)
 	}
 
+	bCache, err := bigcache.New(context.Background(), bigcache.Config{
+		Shards: 32})
+	if err != nil {
+		return nil, err
+	}
+
 	s := &segment{
+		cache:  bCache,
 		id:     id,
 		fd:     fd,
 		header: make([]byte, chunkHeaderSize),
@@ -231,10 +242,20 @@ func (seg *segment) writeToBuffer(data []byte, chunkBuffer *bytebufferpool.ByteB
 	}
 
 	dataSize := uint32(len(data))
+	startPos := chunkBuffer.Len()
+
 	// The entire chunk can fit into the block.
 	if seg.currentBlockSize.Load()+dataSize+chunkHeaderSize <= blockSize {
 		seg.appendChunkBuffer(chunkBuffer, data, ChunkTypeFull)
 		position.ChunkSize = dataSize + chunkHeaderSize
+		// Cache the chunk data
+		chunk := chunkBuffer.B[startPos:chunkBuffer.Len()]
+		err := seg.cache.Set(makeCacheKey(position.BlockNumber, position.ChunkOffset), chunk)
+		if err != nil {
+			// Log error but continue, as cache errors shouldn't stop the write
+			slog.Error("failed to cache chunk", "error", err)
+		}
+		//seg.setChunkCache(position.BlockNumber, position.ChunkOffset, chunk)
 	} else {
 		// If the size of the data exceeds the size of the block,
 		// the data should be written to the block in batches.
@@ -242,6 +263,7 @@ func (seg *segment) writeToBuffer(data []byte, chunkBuffer *bytebufferpool.ByteB
 			leftSize             = dataSize
 			blockCount    uint32 = 0
 			currBlockSize        = seg.currentBlockSize.Load()
+			dataOffset           = uint32(0)
 		)
 
 		for leftSize > 0 {
@@ -250,7 +272,7 @@ func (seg *segment) writeToBuffer(data []byte, chunkBuffer *bytebufferpool.ByteB
 				chunkSize = leftSize
 			}
 
-			var end = dataSize - leftSize + chunkSize
+			var end = dataOffset + chunkSize
 			if end > dataSize {
 				end = dataSize
 			}
@@ -265,8 +287,17 @@ func (seg *segment) writeToBuffer(data []byte, chunkBuffer *bytebufferpool.ByteB
 			default: // Middle chunk
 				chunkType = ChunkTypeMiddle
 			}
-			seg.appendChunkBuffer(chunkBuffer, data[dataSize-leftSize:end], chunkType)
+			chunkStartPos := chunkBuffer.Len()
+			seg.appendChunkBuffer(chunkBuffer, data[dataOffset:end], chunkType)
 
+			// Cache each chunk
+			chunk := chunkBuffer.B[chunkStartPos:chunkBuffer.Len()]
+			cacheKey := makeCacheKey(position.BlockNumber+blockCount, int64(currBlockSize))
+			if err := seg.cache.Set(cacheKey, chunk); err != nil {
+				slog.Error("failed to cache chunk", "error", err)
+			}
+
+			dataOffset += chunkSize
 			leftSize -= chunkSize
 			blockCount += 1
 			currBlockSize = (currBlockSize + chunkSize + chunkHeaderSize) % blockSize
@@ -351,6 +382,7 @@ func (seg *segment) Write(data []byte) (pos *ChunkPosition, err error) {
 
 	// write all data to the chunk buffer
 	pos, err = seg.writeToBuffer(data, chunkBuffer)
+
 	if err != nil {
 		return
 	}
@@ -362,7 +394,8 @@ func (seg *segment) Write(data []byte) (pos *ChunkPosition, err error) {
 	return
 }
 
-func (seg *segment) appendChunkBuffer(buf *bytebufferpool.ByteBuffer, data []byte, chunkType ChunkType) {
+func (seg *segment) appendChunkBuffer(buf *bytebufferpool.ByteBuffer, data []byte, chunkType ChunkType) []byte {
+	start := len(buf.B)
 	// Length	2 Bytes	index:4-5
 	binary.LittleEndian.PutUint16(seg.header[4:6], uint16(len(data)))
 	// Type	1 Byte	index:6
@@ -375,6 +408,7 @@ func (seg *segment) appendChunkBuffer(buf *bytebufferpool.ByteBuffer, data []byt
 	// append the header and data to segment chunk buffer
 	buf.B = append(buf.B, seg.header...)
 	buf.B = append(buf.B, data...)
+	return buf.B[start:]
 }
 
 // write the pending chunk buffer to the segment file
@@ -441,6 +475,7 @@ func (seg *segment) readInternal(blockNumber uint32, chunkOffset int64) ([]byte,
 			// 2. new writes appended to the block, and the block
 			// is still smaller than 32KB, we must read it again because of the new writes.
 			if seg.startupBlock.blockNumber != int64(blockNumber) || size != blockSize {
+
 				// read block from segment file at the specified offset.
 				_, err := seg.fd.ReadAt(block[0:size], offset)
 				if err != nil {
@@ -450,9 +485,33 @@ func (seg *segment) readInternal(blockNumber uint32, chunkOffset int64) ([]byte,
 				seg.startupBlock.blockNumber = int64(blockNumber)
 			}
 		} else {
-			if _, err := seg.fd.ReadAt(block[0:size], offset); err != nil {
-				return nil, nil, err
+			//cachedBlock, err := seg.cache.Get(makeCacheKey(blockNumber, chunkOffset))
+			//if errors.Is(err, bigcache.ErrEntryNotFound) {
+			// Try to get the chunk from cache
+			cachedData, err := seg.cache.Get(makeCacheKey(blockNumber, chunkOffset))
+			if errors.Is(err, bigcache.ErrEntryNotFound) {
+				if _, err := seg.fd.ReadAt(block[0:size], offset); err != nil {
+					return nil, nil, err
+				}
+			} else {
+				// Cache hit - Copy header
+				copy(block[chunkOffset:], cachedData[:chunkHeaderSize])
+
+				// Get the length from header
+				length := binary.LittleEndian.Uint16(cachedData[4:6])
+
+				// Copy data portion
+				copy(block[chunkOffset+chunkHeaderSize:], cachedData[chunkHeaderSize:chunkHeaderSize+length])
 			}
+
+			// Cache the block
+			//seg.setChunkCache(blockNumber, chunkOffset, block[:size])
+
+			//} else {
+			//	// Cache hit
+			//	block = make([]byte, len(cachedBlock))
+			//	copy(block, cachedBlock)
+			//}
 		}
 
 		// header
@@ -590,5 +649,27 @@ func DecodeChunkPosition(buf []byte) *ChunkPosition {
 		BlockNumber: uint32(blockNumber),
 		ChunkOffset: int64(chunkOffset),
 		ChunkSize:   uint32(chunkSize),
+	}
+}
+
+func makeCacheKey(blockNumber uint32, chunkOffset int64) string {
+	buf := make([]byte, 12)
+	binary.BigEndian.PutUint32(buf[0:4], blockNumber)
+	binary.BigEndian.PutUint64(buf[4:], uint64(chunkOffset))
+	return string(buf)
+}
+
+func (seg *segment) setChunkCache(blockNumber uint32, chunkOffset int64, data []byte) {
+	cacheKey := makeCacheKey(blockNumber, chunkOffset)
+
+	// Make a safe copy before caching
+	copied := make([]byte, len(data))
+	copy(copied, data)
+
+	if err := seg.cache.Set(cacheKey, copied); err != nil {
+		slog.Error("failed to set chunk cache",
+			slog.String("key", cacheKey),
+			slog.Any("err", err),
+		)
 	}
 }
