@@ -237,8 +237,6 @@ func (wal *WAL) NewReaderWithStart(startPos *ChunkPosition) (*Reader, error) {
 	if startPos == nil {
 		return nil, errors.New("start position is nil")
 	}
-	wal.mu.RLock()
-	defer wal.mu.RUnlock()
 
 	reader := wal.NewReader()
 	for {
@@ -425,7 +423,6 @@ func (wal *WAL) Write(data []byte) (*ChunkPosition, error) {
 // Read reads the data from the WAL according to the given position.
 func (wal *WAL) Read(pos *ChunkPosition) ([]byte, error) {
 	wal.mu.RLock()
-	defer wal.mu.RUnlock()
 
 	// find the segment file according to the position.
 	var segment *segment
@@ -434,7 +431,7 @@ func (wal *WAL) Read(pos *ChunkPosition) ([]byte, error) {
 	} else {
 		segment = wal.olderSegments[pos.SegmentId]
 	}
-
+	wal.mu.RUnlock()
 	if segment == nil {
 		return nil, fmt.Errorf("segment file %d%s not found", pos.SegmentId, wal.options.SegmentFileExt)
 	}
@@ -489,9 +486,15 @@ func (wal *WAL) Delete() error {
 // Sync syncs the active segment file to stable storage like disk.
 func (wal *WAL) Sync() error {
 	wal.mu.Lock()
-	defer wal.mu.Unlock()
-
-	return wal.activeSegment.Sync()
+	activeSegment := wal.activeSegment
+	wal.mu.Unlock()
+	if activeSegment == nil {
+		return errors.New("no active segment")
+	}
+	if activeSegment.closed.Load() {
+		return nil
+	}
+	return activeSegment.Sync()
 }
 
 // RenameFileExt renames all segment files' extension name.
