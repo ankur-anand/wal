@@ -916,7 +916,7 @@ func TestEOFOnActiveSegment(t *testing.T) {
 			t.Errorf("error removing test directory: %v", err)
 		}
 	}()
-	
+
 	t.Run("EmptyWAL", func(t *testing.T) {
 		reader := w.NewReader()
 		_, _, err := reader.Next()
