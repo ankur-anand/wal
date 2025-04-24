@@ -19,6 +19,7 @@ const (
 var (
 	ErrValueTooLarge       = errors.New("the data size can't larger than segment size")
 	ErrPendingSizeTooLarge = errors.New("the upper bound of pendingWrites can't larger than segment size")
+	ErrFsync               = errors.New("fsync error")
 )
 
 // WAL represents a Write-Ahead Log structure that provides durability
@@ -121,22 +122,6 @@ func Open(options Options) (*WAL, error) {
 		}
 	}
 
-	// only start the sync operation if the SyncInterval is greater than 0.
-	if wal.options.SyncInterval > 0 {
-		wal.syncTicker = time.NewTicker(wal.options.SyncInterval)
-		go func() {
-			for {
-				select {
-				case <-wal.syncTicker.C:
-					_ = wal.Sync()
-				case <-wal.closeC:
-					wal.syncTicker.Stop()
-					return
-				}
-			}
-		}()
-	}
-
 	return wal, nil
 }
 
@@ -156,7 +141,7 @@ func (wal *WAL) OpenNewActiveSegment() error {
 	defer wal.mu.Unlock()
 	// sync the active segment file.
 	if err := wal.activeSegment.Sync(); err != nil {
-		return err
+		return fmt.Errorf("%w: %v", ErrFsync, err)
 	}
 	// create a new segment file and set it as the active one.
 	segment, err := openSegmentFile(wal.options.DirPath, wal.options.SegmentFileExt,
@@ -333,7 +318,7 @@ func (wal *WAL) PendingWrites(data []byte) {
 // rotateActiveSegment create a new segment file and replace the activeSegment.
 func (wal *WAL) rotateActiveSegment() error {
 	if err := wal.activeSegment.Sync(); err != nil {
-		return err
+		return fmt.Errorf("%w: %v", ErrFsync, err)
 	}
 	wal.bytesWrite = 0
 	segment, err := openSegmentFile(wal.options.DirPath, wal.options.SegmentFileExt,
@@ -412,7 +397,7 @@ func (wal *WAL) Write(data []byte) (*ChunkPosition, error) {
 	}
 	if needSync {
 		if err := wal.activeSegment.Sync(); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("%w: %v", ErrFsync, err)
 		}
 		wal.bytesWrite = 0
 	}
@@ -494,7 +479,10 @@ func (wal *WAL) Sync() error {
 	if activeSegment.closed.Load() {
 		return nil
 	}
-	return activeSegment.Sync()
+	if err := activeSegment.Sync(); err != nil {
+		return fmt.Errorf("%w: %v", ErrFsync, err)
+	}
+	return nil
 }
 
 // RenameFileExt renames all segment files' extension name.
